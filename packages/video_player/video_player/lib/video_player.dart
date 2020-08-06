@@ -6,20 +6,21 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:meta/meta.dart';
-
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
+
+import 'src/closed_caption_file.dart';
+
 export 'package:video_player_platform_interface/video_player_platform_interface.dart'
     show DurationRange, DataSourceType, VideoFormat;
 
-import 'src/closed_caption_file.dart';
 export 'src/closed_caption_file.dart';
 
 final VideoPlayerPlatform _videoPlayerPlatform = VideoPlayerPlatform.instance
-  // This will clear all open videos on the platform when a full restart is
-  // performed.
+// This will clear all open videos on the platform when a full restart is
+// performed.
   ..init();
 
 /// The duration, current position, buffering state, error state and settings
@@ -168,7 +169,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// null. The [package] argument must be non-null when the asset comes from a
   /// package and null otherwise.
   VideoPlayerController.asset(this.dataSource,
-      {this.package, this.closedCaptionFile})
+      {this.package, this.closedCaptionFile, this.onCompleted})
       : dataSourceType = DataSourceType.asset,
         formatHint = null,
         super(VideoPlayerValue(duration: null));
@@ -181,7 +182,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// **Android only**: The [formatHint] option allows the caller to override
   /// the video format detection code.
   VideoPlayerController.network(this.dataSource,
-      {this.formatHint, this.closedCaptionFile})
+      {this.formatHint, this.closedCaptionFile, this.onCompleted})
       : dataSourceType = DataSourceType.network,
         package = null,
         super(VideoPlayerValue(duration: null));
@@ -190,7 +191,8 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   ///
   /// This will load the file from the file-URI given by:
   /// `'file://${file.path}'`.
-  VideoPlayerController.file(File file, {this.closedCaptionFile})
+  VideoPlayerController.file(File file,
+      {this.closedCaptionFile, this.onCompleted})
       : dataSource = 'file://${file.path}',
         dataSourceType = DataSourceType.file,
         package = null,
@@ -214,6 +216,8 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// Only set for [asset] videos. The package that the asset was loaded from.
   final String package;
 
+  final Function onCompleted;
+
   /// Optional field to specify a file containing the closed
   /// captioning.
   ///
@@ -221,12 +225,16 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// [initialize()] is called.
   final Future<ClosedCaptionFile> closedCaptionFile;
 
+  bool get isDisposed => _isDisposed;
+
   ClosedCaptionFile _closedCaptionFile;
   Timer _timer;
   bool _isDisposed = false;
   Completer<void> _creatingCompleter;
   StreamSubscription<dynamic> _eventSubscription;
   _VideoAppLifeCycleObserver _lifeCycleObserver;
+
+  VideoEventType _eventType;
 
   /// This is just exposed for testing. It shouldn't be used by anyone depending
   /// on the plugin.
@@ -271,6 +279,10 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
         return;
       }
 
+      if (_eventType == VideoEventType.completed) {
+        return;
+      }
+
       switch (event.eventType) {
         case VideoEventType.initialized:
           value = value.copyWith(
@@ -283,6 +295,9 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
           _applyPlayPause();
           break;
         case VideoEventType.completed:
+          if (onCompleted != null) {
+            onCompleted();
+          }
           value = value.copyWith(isPlaying: false, position: value.duration);
           _timer?.cancel();
           break;
@@ -298,6 +313,8 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
         case VideoEventType.unknown:
           break;
       }
+
+      _eventType = event.eventType;
     }
 
     if (closedCaptionFile != null) {
@@ -376,7 +393,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
       await _videoPlayerPlatform.play(_textureId);
       _timer = Timer.periodic(
         const Duration(milliseconds: 500),
-        (Timer timer) async {
+            (Timer timer) async {
           if (_isDisposed) {
             return;
           }
@@ -478,7 +495,11 @@ class _VideoAppLifeCycleObserver extends Object with WidgetsBindingObserver {
     switch (state) {
       case AppLifecycleState.paused:
         _wasPlayingBeforePause = _controller.value.isPlaying;
-        _controller.pause();
+        if (_wasPlayingBeforePause) {
+          _controller.play();
+        } else {
+          _controller.pause();
+        }
         break;
       case AppLifecycleState.resumed:
         if (_wasPlayingBeforePause) {
@@ -534,7 +555,10 @@ class _VideoPlayerState extends State<VideoPlayer> {
   @override
   void didUpdateWidget(VideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    oldWidget.controller.removeListener(_listener);
+
+    if (!oldWidget.controller.isDisposed) {
+      oldWidget.controller.removeListener(_listener);
+    }
     _textureId = widget.controller.textureId;
     widget.controller.addListener(_listener);
   }
@@ -542,7 +566,10 @@ class _VideoPlayerState extends State<VideoPlayer> {
   @override
   void deactivate() {
     super.deactivate();
-    widget.controller.removeListener(_listener);
+
+    if (!widget.controller.isDisposed) {
+      widget.controller.removeListener(_listener);
+    }
   }
 
   @override
@@ -668,8 +695,7 @@ class VideoProgressIndicator extends StatefulWidget {
   /// Defaults will be used for everything except [controller] if they're not
   /// provided. [allowScrubbing] defaults to false, and [padding] will default
   /// to `top: 5.0`.
-  VideoProgressIndicator(
-    this.controller, {
+  VideoProgressIndicator(this.controller, {
     VideoProgressColors colors,
     this.allowScrubbing,
     this.padding = const EdgeInsets.only(top: 5.0),
@@ -818,10 +844,13 @@ class ClosedCaption extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final TextStyle effectiveTextStyle = textStyle ??
-        DefaultTextStyle.of(context).style.copyWith(
-              fontSize: 36.0,
-              color: Colors.white,
-            );
+        DefaultTextStyle
+            .of(context)
+            .style
+            .copyWith(
+          fontSize: 36.0,
+          color: Colors.white,
+        );
 
     if (text == null) {
       return SizedBox.shrink();
