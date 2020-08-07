@@ -169,7 +169,13 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// null. The [package] argument must be non-null when the asset comes from a
   /// package and null otherwise.
   VideoPlayerController.asset(this.dataSource,
-      {this.package, this.closedCaptionFile, this.onCompleted})
+      {this.package,
+        this.closedCaptionFile,
+        this.onCompleted,
+        this.isBackground = false,
+        this.timeoutInBackground = 5000,
+        this.timeoutInForeground = 8000,
+      })
       : dataSourceType = DataSourceType.asset,
         formatHint = null,
         super(VideoPlayerValue(duration: null));
@@ -182,7 +188,13 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// **Android only**: The [formatHint] option allows the caller to override
   /// the video format detection code.
   VideoPlayerController.network(this.dataSource,
-      {this.formatHint, this.closedCaptionFile, this.onCompleted})
+      {this.formatHint,
+        this.closedCaptionFile,
+        this.onCompleted,
+        this.isBackground = false,
+        this.timeoutInBackground = 5000,
+        this.timeoutInForeground = 8000,
+      })
       : dataSourceType = DataSourceType.network,
         package = null,
         super(VideoPlayerValue(duration: null));
@@ -192,7 +204,12 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// This will load the file from the file-URI given by:
   /// `'file://${file.path}'`.
   VideoPlayerController.file(File file,
-      {this.closedCaptionFile, this.onCompleted})
+      {this.closedCaptionFile,
+        this.onCompleted,
+        this.isBackground = false,
+        this.timeoutInBackground = 5000,
+        this.timeoutInForeground = 8000,
+      })
       : dataSource = 'file://${file.path}',
         dataSourceType = DataSourceType.file,
         package = null,
@@ -200,6 +217,10 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
         super(VideoPlayerValue(duration: null));
 
   int _textureId;
+
+
+  /// Application is in the background or in the foreground
+  final bool isBackground;
 
   /// The URI to the video file. This will be in different formats depending on
   /// the [DataSourceType] of the original video.
@@ -218,6 +239,10 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   final Function onCompleted;
 
+  final int timeoutInBackground;
+
+  final int timeoutInForeground;
+
   /// Optional field to specify a file containing the closed
   /// captioning.
   ///
@@ -229,6 +254,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   ClosedCaptionFile _closedCaptionFile;
   Timer _timer;
+  Timer _timeout;
   bool _isDisposed = false;
   Completer<void> _creatingCompleter;
   StreamSubscription<dynamic> _eventSubscription;
@@ -274,6 +300,9 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     _creatingCompleter.complete(null);
     final Completer<void> initializingCompleter = Completer<void>();
 
+    setTimeout(initializingCompleter);
+
+
     void eventListener(VideoEvent event) {
       if (_isDisposed) {
         return;
@@ -290,6 +319,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
             size: event.size,
           );
           initializingCompleter.complete(null);
+          _timeout?.cancel();
           _applyLooping();
           _applyVolume();
           _applyPlayPause();
@@ -327,6 +357,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     void errorListener(Object obj) {
       final PlatformException e = obj;
       value = VideoPlayerValue.erroneous(e.message);
+      _timeout?.cancel();
       _timer?.cancel();
       if (!initializingCompleter.isCompleted) {
         initializingCompleter.completeError(obj);
@@ -353,6 +384,18 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     }
     _isDisposed = true;
     super.dispose();
+  }
+
+  void setTimeout(Completer<void> initializingCompleter) {
+    _timeout?.cancel();
+    _timeout = Timer(Duration(
+        milliseconds: (isBackground ?? false)
+            ? timeoutInBackground
+            : timeoutInForeground), () {
+      initializingCompleter.completeError('Timeout!');
+      _timeout.cancel();
+      _timeout = null;
+    });
   }
 
   /// Starts playing the video.
