@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:meta/meta.dart';
+import 'package:rxdart/rxdart.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
 
 import 'src/closed_caption_file.dart';
@@ -22,6 +23,15 @@ final VideoPlayerPlatform _videoPlayerPlatform = VideoPlayerPlatform.instance
 // This will clear all open videos on the platform when a full restart is
 // performed.
   ..init();
+
+enum VideoPlayerState {
+  buffering,
+  initialized,
+  played,
+  paused,
+  completed,
+  unknow,
+}
 
 /// The duration, current position, buffering state, error state and settings
 /// of a [VideoPlayerController].
@@ -250,7 +260,19 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// [initialize()] is called.
   final Future<ClosedCaptionFile> closedCaptionFile;
 
+  final _onStateSubject = BehaviorSubject<VideoPlayerState>();
+
+  Stream<VideoPlayerState> get onStateChanged => _onStateSubject.stream;
+
   bool get isDisposed => _isDisposed;
+
+  bool get initialized => value?.initialized ?? false;
+
+  bool get isBuffering => value?.isBuffering ?? false;
+
+  bool get isPlaying => initialized && (value?.isPlaying ?? false);
+
+  bool get isPaused => !isPlaying;
 
   ClosedCaptionFile _closedCaptionFile;
   Timer _timer;
@@ -319,6 +341,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
             size: event.size,
           );
           initializingCompleter.complete(null);
+          _onStateSubject.add(VideoPlayerState.initialized);
           _timeout?.cancel();
           _applyLooping();
           _applyVolume();
@@ -328,6 +351,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
           if (onCompleted != null) {
             onCompleted();
           }
+          _onStateSubject.add(VideoPlayerState.completed);
           value = value.copyWith(isPlaying: false, position: value.duration);
           _timer?.cancel();
           break;
@@ -335,12 +359,22 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
           value = value.copyWith(buffered: event.buffered);
           break;
         case VideoEventType.bufferingStart:
+          _onStateSubject.add(VideoPlayerState.buffering);
           value = value.copyWith(isBuffering: true);
           break;
         case VideoEventType.bufferingEnd:
+          if (isPlaying) {
+            _onStateSubject.add(VideoPlayerState.played);
+          } else if (initialized) {
+            _onStateSubject.add(VideoPlayerState.paused);
+          } else {
+            _onStateSubject.add(VideoPlayerState.buffering);
+          }
+
           value = value.copyWith(isBuffering: false);
           break;
         case VideoEventType.unknown:
+          _onStateSubject.add(VideoPlayerState.unknow);
           break;
       }
 
@@ -373,6 +407,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   @override
   Future<void> dispose() async {
     if (_creatingCompleter != null) {
+      _onStateSubject.add(VideoPlayerState.unknow);
       await _creatingCompleter.future;
       if (!_isDisposed) {
         _isDisposed = true;
@@ -380,6 +415,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
         await _eventSubscription?.cancel();
         await _videoPlayerPlatform.dispose(_textureId);
       }
+      _onStateSubject.close();
       _lifeCycleObserver.dispose();
     }
     _isDisposed = true;
@@ -404,6 +440,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// has been sent to the platform, not when playback itself is totally
   /// finished.
   Future<void> play() async {
+    _onStateSubject.add(VideoPlayerState.played);
     value = value.copyWith(isPlaying: true);
     await _applyPlayPause();
   }
@@ -417,6 +454,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   /// Pauses the video.
   Future<void> pause() async {
+    _onStateSubject.add(VideoPlayerState.paused);
     value = value.copyWith(isPlaying: false);
     await _applyPlayPause();
   }
@@ -482,6 +520,9 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     } else if (position < const Duration()) {
       position = const Duration();
     }
+
+    _onStateSubject.add(
+        isPlaying ? VideoPlayerState.played : VideoPlayerState.paused);
     await _videoPlayerPlatform.seekTo(_textureId, position);
     _updatePosition(position);
   }
