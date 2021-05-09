@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:meta/meta.dart';
+import 'package:rxdart/rxdart.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
 
 export 'package:video_player_platform_interface/video_player_platform_interface.dart'
@@ -21,6 +22,15 @@ final VideoPlayerPlatform _videoPlayerPlatform = VideoPlayerPlatform.instance
   // This will clear all open videos on the platform when a full restart is
   // performed.
   ..init();
+
+enum VideoPlayerState {
+  buffering,
+  initialized,
+  played,
+  paused,
+  completed,
+  unknow,
+}
 
 /// The duration, current position, buffering state, error state and settings
 /// of a [VideoPlayerController].
@@ -174,9 +184,16 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// The name of the asset is given by the [dataSource] argument and must not be
   /// null. The [package] argument must be non-null when the asset comes from a
   /// package and null otherwise.
-  VideoPlayerController.asset(this.dataSource,
-      {this.package, this.closedCaptionFile, this.videoPlayerOptions})
-      : dataSourceType = DataSourceType.asset,
+  VideoPlayerController.asset(
+    this.dataSource, {
+    this.package,
+    this.closedCaptionFile,
+    this.videoPlayerOptions,
+    this.onCompleted,
+    this.isBackground = false,
+    this.timeoutInBackground = 5000,
+    this.timeoutInForeground = 8000,
+  })  : dataSourceType = DataSourceType.asset,
         formatHint = null,
         super(VideoPlayerValue(duration: null));
 
@@ -187,9 +204,16 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// null.
   /// **Android only**: The [formatHint] option allows the caller to override
   /// the video format detection code.
-  VideoPlayerController.network(this.dataSource,
-      {this.formatHint, this.closedCaptionFile, this.videoPlayerOptions})
-      : dataSourceType = DataSourceType.network,
+  VideoPlayerController.network(
+    this.dataSource, {
+    this.formatHint,
+    this.closedCaptionFile,
+    this.videoPlayerOptions,
+    this.onCompleted,
+    this.isBackground = false,
+    this.timeoutInBackground = 5000,
+    this.timeoutInForeground = 8000,
+  })  : dataSourceType = DataSourceType.network,
         package = null,
         super(VideoPlayerValue(duration: null));
 
@@ -197,15 +221,24 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   ///
   /// This will load the file from the file-URI given by:
   /// `'file://${file.path}'`.
-  VideoPlayerController.file(File file,
-      {this.closedCaptionFile, this.videoPlayerOptions})
-      : dataSource = 'file://${file.path}',
+  VideoPlayerController.file(
+    File file, {
+    this.closedCaptionFile,
+    this.videoPlayerOptions,
+    this.onCompleted,
+    this.isBackground = false,
+    this.timeoutInBackground = 5000,
+    this.timeoutInForeground = 8000,
+  })  : dataSource = 'file://${file.path}',
         dataSourceType = DataSourceType.file,
         package = null,
         formatHint = null,
         super(VideoPlayerValue(duration: null));
 
   int _textureId;
+
+  /// Application is in the background or in the foreground
+  final bool isBackground;
 
   /// The URI to the video file. This will be in different formats depending on
   /// the [DataSourceType] of the original video.
@@ -225,6 +258,12 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// Only set for [asset] videos. The package that the asset was loaded from.
   final String package;
 
+  final Function onCompleted;
+
+  final int timeoutInBackground;
+
+  final int timeoutInForeground;
+
   /// Optional field to specify a file containing the closed
   /// captioning.
   ///
@@ -232,12 +271,27 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// [initialize()] is called.
   final Future<ClosedCaptionFile> closedCaptionFile;
 
+  final _onStateSubject = BehaviorSubject<VideoPlayerState>();
+  Stream<VideoPlayerState> get onStateChanged => _onStateSubject.stream;
+
+  bool get initialized => value?.initialized ?? false;
+
+  bool get isBuffering => value?.isBuffering ?? false;
+
+  bool get isPlaying => initialized && (value?.isPlaying ?? false);
+
+  bool get isPaused => !isPlaying;
+
+  bool get isDisposed => _isDisposed;
+
   ClosedCaptionFile _closedCaptionFile;
   Timer _timer;
+  Timer _timeout;
   bool _isDisposed = false;
   Completer<void> _creatingCompleter;
   StreamSubscription<dynamic> _eventSubscription;
   _VideoAppLifeCycleObserver _lifeCycleObserver;
+   VideoEventType _eventType;
 
   /// This is just exposed for testing. It shouldn't be used by anyone depending
   /// on the plugin.
@@ -283,8 +337,14 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     _creatingCompleter.complete(null);
     final Completer<void> initializingCompleter = Completer<void>();
 
+    setTimeout(initializingCompleter);
+
     void eventListener(VideoEvent event) {
       if (_isDisposed) {
+        return;
+      }
+
+      if (_eventType == VideoEventType.completed) {
         return;
       }
 
@@ -295,11 +355,17 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
             size: event.size,
           );
           initializingCompleter.complete(null);
+          _onStateSubject.add(VideoPlayerState.initialized);
+          _timeout?.cancel();
           _applyLooping();
           _applyVolume();
           _applyPlayPause();
           break;
         case VideoEventType.completed:
+          if (onCompleted != null) {
+            onCompleted();
+          }
+          _onStateSubject.add(VideoPlayerState.completed);
           value = value.copyWith(isPlaying: false, position: value.duration);
           _timer?.cancel();
           break;
@@ -307,14 +373,24 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
           value = value.copyWith(buffered: event.buffered);
           break;
         case VideoEventType.bufferingStart:
+          _onStateSubject.add(VideoPlayerState.buffering);
           value = value.copyWith(isBuffering: true);
           break;
         case VideoEventType.bufferingEnd:
+          if (isPlaying) {
+            _onStateSubject.add(VideoPlayerState.played);
+          } else if (initialized) {
+            _onStateSubject.add(VideoPlayerState.paused);
+          } else {
+            _onStateSubject.add(VideoPlayerState.buffering);
+          }
           value = value.copyWith(isBuffering: false);
           break;
         case VideoEventType.unknown:
+          _onStateSubject.add(VideoPlayerState.unknow);
           break;
       }
+      _eventType = event.eventType;
     }
 
     if (closedCaptionFile != null) {
@@ -327,6 +403,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     void errorListener(Object obj) {
       final PlatformException e = obj;
       value = VideoPlayerValue.erroneous(e.message);
+      _timeout?.cancel();
       _timer?.cancel();
       if (!initializingCompleter.isCompleted) {
         initializingCompleter.completeError(obj);
@@ -339,9 +416,23 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     return initializingCompleter.future;
   }
 
+  void setTimeout(Completer<void> initializingCompleter) {
+    _timeout?.cancel();
+    _timeout = Timer(
+        Duration(
+            milliseconds: (isBackground ?? false)
+                ? timeoutInBackground
+                : timeoutInForeground), () {
+      initializingCompleter.completeError('Timeout!');
+      _timeout.cancel();
+      _timeout = null;
+    });
+  }
+
   @override
   Future<void> dispose() async {
     if (_creatingCompleter != null) {
+      _onStateSubject.add(VideoPlayerState.unknow);
       await _creatingCompleter.future;
       if (!_isDisposed) {
         _isDisposed = true;
@@ -349,6 +440,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
         await _eventSubscription?.cancel();
         await _videoPlayerPlatform.dispose(_textureId);
       }
+      _onStateSubject.close();
       _lifeCycleObserver.dispose();
     }
     _isDisposed = true;
@@ -361,6 +453,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// has been sent to the platform, not when playback itself is totally
   /// finished.
   Future<void> play() async {
+    _onStateSubject.add(VideoPlayerState.played);
     value = value.copyWith(isPlaying: true);
     await _applyPlayPause();
   }
@@ -374,6 +467,7 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   /// Pauses the video.
   Future<void> pause() async {
+    _onStateSubject.add(VideoPlayerState.paused);
     value = value.copyWith(isPlaying: false);
     await _applyPlayPause();
   }
@@ -463,6 +557,8 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     } else if (position < const Duration()) {
       position = const Duration();
     }
+    _onStateSubject
+        .add(isPlaying ? VideoPlayerState.played : VideoPlayerState.paused);
     await _videoPlayerPlatform.seekTo(_textureId, position);
     _updatePosition(position);
   }
@@ -553,7 +649,11 @@ class _VideoAppLifeCycleObserver extends Object with WidgetsBindingObserver {
     switch (state) {
       case AppLifecycleState.paused:
         _wasPlayingBeforePause = _controller.value.isPlaying;
-        _controller.pause();
+        if (_wasPlayingBeforePause) {
+          _controller.play();
+        } else {
+          _controller.pause();
+        }
         break;
       case AppLifecycleState.resumed:
         if (_wasPlayingBeforePause) {
@@ -610,6 +710,10 @@ class _VideoPlayerState extends State<VideoPlayer> {
   void didUpdateWidget(VideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
     oldWidget.controller.removeListener(_listener);
+
+    if (!oldWidget.controller.isDisposed) {
+      oldWidget.controller.removeListener(_listener);
+    }
     _textureId = widget.controller.textureId;
     widget.controller.addListener(_listener);
   }
@@ -618,6 +722,10 @@ class _VideoPlayerState extends State<VideoPlayer> {
   void deactivate() {
     super.deactivate();
     widget.controller.removeListener(_listener);
+
+    if (!widget.controller.isDisposed) {
+      widget.controller.removeListener(_listener);
+    }
   }
 
   @override
